@@ -362,6 +362,13 @@ async def _discover_and_register_server(name: str, config: dict) -> list[str]:
     return registered_names
 
 
+def _recycled_stdio(server) -> bool:
+    """True for a stdio server Hermes recycled at its idle/lifetime limit (not parked: its tools
+    stay registered and the next call wakes it)."""
+    from tools.mcp_tool_health import is_recycled_stdio
+    return is_recycled_stdio(server)
+
+
 def _select_new_servers(servers: dict[str, dict]) -> dict[str, dict]:
     """Pick connect candidates (enabled, not connected/connecting/lazy, not in backoff) and
     refresh per-server bookkeeping. Known servers without a live session are parked or
@@ -382,7 +389,11 @@ def _select_new_servers(servers: dict[str, dict]) -> dict[str, dict]:
             and mcp_server_enabled(v) and not _connect_cooldown_active(k)}
         stale_cached = [_core._servers[keys[k]] for k, v in servers.items()
                         if keys[k] in _core._servers and mcp_server_enabled(v)
-                        and getattr(_core._servers[keys[k]], "session", None) is None]
+                        and getattr(_core._servers[keys[k]], "session", None) is None
+                        # A recycled stdio server is not parked (its tools stay registered and the
+                        # next call wakes it): waking it here would respawn the child discovery is
+                        # trying to keep dormant.
+                        and not _recycled_stdio(_core._servers[keys[k]])]
         for srv_name in new_servers:
             _core._server_connecting.add(keys[srv_name])
             _core._server_scope_keys[keys[srv_name]] = current_scope

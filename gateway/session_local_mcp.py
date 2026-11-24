@@ -18,6 +18,8 @@ import hashlib
 import hmac
 import json
 import logging
+import math
+import os
 import threading
 import uuid
 
@@ -29,6 +31,38 @@ logger = logging.getLogger(__name__)
 PRIVATE_KEY = ('editor_mcp',)
 _HELD_LOCK = threading.Lock()
 _RELIST_TIMEOUT = 5  # seconds an admission start waits on a held server's tools/list
+# An editor stdio server is a Node process of ~45-70 MB held for the session's whole life, though a
+# chat uses it in bursts. Hermes recycles an idle stdio child and wakes it on the next tool call, so
+# a long-lived ACP session (a Buzz chat) costs nothing between bursts. HTTP/SSE servers keep no
+# local child and are left alone.
+_EDITOR_STDIO_IDLE_TIMEOUT_SECONDS = 1200  # 20 minutes; 0 or negative disables recycling
+_EDITOR_STDIO_IDLE_TIMEOUT_ENV = 'HERMES_EDITOR_MCP_IDLE_TIMEOUT_SECONDS'
+
+
+def _editor_stdio_idle_timeout():
+    """The stdio ``idle_timeout_seconds`` editor servers get: the env override when it parses,
+    else the default. An unset, empty or non-numeric value never disables recycling by accident;
+    only an explicit ``0`` (or a negative) does."""
+    raw = os.environ.get(_EDITOR_STDIO_IDLE_TIMEOUT_ENV)
+    if raw is None or not raw.strip():
+        return _EDITOR_STDIO_IDLE_TIMEOUT_SECONDS
+    try:
+        seconds = float(raw)
+    except ValueError:
+        return _EDITOR_STDIO_IDLE_TIMEOUT_SECONDS
+    return seconds if math.isfinite(seconds) else _EDITOR_STDIO_IDLE_TIMEOUT_SECONDS
+
+
+def _recycled_stdio(server):
+    """Whether *server* is a stdio server Hermes parked on purpose at its idle/lifetime limit.
+    It keeps its registry tools and reconnects on the next call, so it is still available."""
+    from tools.mcp_tool_health import is_recycled_stdio
+    return is_recycled_stdio(server)
+
+
+def _available(server):
+    """A held server is usable when its session is live, or when it was recycled and wakes lazily."""
+    return server is not None and (server.session is not None or _recycled_stdio(server))
 
 
 def _json(value):
@@ -127,12 +161,17 @@ def _frozen_toolset(data, toolset):
 
 
 def _configs(servers, names, cwd):
+    idle_timeout = _editor_stdio_idle_timeout()
     configs = {}
     for i, name in names.items():
         spec = servers[i]
         if spec.get('type', 'stdio') == 'stdio':
             config = {'command': spec['command'], 'args': spec['args'],
                       'env': {e['name']: e['value'] for e in spec.get('env', [])}, 'cwd': cwd}
+            if idle_timeout > 0:
+                # Hermes recycles the idle child and reconnects it on the next call; a recycled
+                # server still counts as available here (``_available``).
+                config['idle_timeout_seconds'] = idle_timeout
         else:
             config = {'url': spec['url'], 'headers': {e['name']: e['value'] for e in spec.get('headers', [])}}
             if spec['type'] == 'sse':
@@ -169,9 +208,11 @@ def _viewed(authority, scope):
 def _connected(scope, names):
     from tools.mcp_tool import _servers
     from tools.mcp_tool_scope import _server_key
-    # Inside the scope the ledger keys are ``(scope, name)``, never bare names.
+    # Inside the scope the ledger keys are ``(scope, name)``, never bare names. A recycled stdio
+    # server (idle/lifetime limit) has no session but keeps its tools and wakes on the next call,
+    # so it is still connected; only a server that is truly gone or down is missing.
     return [i for i, name in names.items()
-            if _server_key(name, scope) in _servers and _servers[_server_key(name, scope)].session]
+            if _available(_servers.get(_server_key(name, scope)))]
 
 
 def _disconnect(held, scope):

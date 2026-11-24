@@ -17,6 +17,17 @@ logger = logging.getLogger("tools.mcp_tool")
 _KEEPALIVE_RPC_TIMEOUT = 30.0
 
 
+def is_recycled_stdio(server) -> bool:
+    """Whether *server* is a stdio server Hermes recycled at its idle/lifetime limit.
+
+    A recycled server is NOT parked: no session is live, but its registry tools stay registered and
+    the next call wakes it (``_get_connected_server_for_call`` → ``_request_lazy_reconnect``), so it
+    counts as available and discovery must not respawn it eagerly. A parked or mid-reconnect server
+    has no tools and is not covered here."""
+    recycled = getattr(server, "_is_recycled_stdio", None)
+    return callable(recycled) and bool(recycled())
+
+
 class MCPServerHealthMixin:
     """Methods of :class:`tools.mcp_tool.MCPServerTask` (mixed in; relies on its attributes)."""
 
